@@ -38,7 +38,10 @@ from torchrec.distributed.fbgemm_qcomm_codec import (
     QCommsConfig,
     get_qcomm_codecs_registry,
 )
-from torchrec.distributed.model_parallel import DistributedModelParallel
+from torchrec.distributed.model_parallel import (
+    DefaultDataParallelWrapper,
+    DistributedModelParallel,
+)
 from torchrec.distributed.planner import Topology
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
@@ -48,53 +51,7 @@ from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-backend = "nccl"
-dist.init_process_group(backend=backend)
-local_rank = dist.get_rank()  # for one node
-world_size = dist.get_world_size()
-torch.cuda.set_device(local_rank)
-device = torch.device(f"cuda:{local_rank}")
-
-# print with rank info
-original_print = builtins.print
-
-
-def rank_print(*args, **kwargs):
-    original_print(f"[RANK {local_rank}] ", *args, **kwargs)
-
-
-builtins.print = rank_print
-
-
-def download_movielens(data_dir="./ml-1m"):
-    if local_rank == 0:
-        os.makedirs(data_dir, exist_ok=True)
-        if os.path.exists(os.path.join(data_dir, "ratings.dat")):
-            print(f"MovieLens in {data_dir}")
-            return data_dir
-
-        url = "https://files.grouplens.org/datasets/movielens/ml-1m.zip"
-        zip_path = os.path.join(data_dir, "ml-1m.zip")
-
-        print(f"download MovieLens-1M...")
-        urllib.request.urlretrieve(url, zip_path)
-
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall(os.path.dirname(data_dir))
-
-        extracted_dir = os.path.join(os.path.dirname(data_dir), "ml-1m")
-        if extracted_dir != data_dir:
-            for file in os.listdir(extracted_dir):
-                shutil.move(
-                    os.path.join(extracted_dir, file), os.path.join(data_dir, file)
-                )
-            if os.path.exists(extracted_dir):
-                shutil.rmtree(extracted_dir)
-
-        os.remove(zip_path)
-
-    return data_dir
-
+print(f"torch.cuda.device_count() : {torch.cuda.device_count()}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TorchRec MovieLens with dynamicemb")
@@ -133,8 +90,100 @@ def parse_args():
     parser.add_argument(
         "--seed", type=int, default=42, help="random seed used for initialization"
     )
+    # 新增多机分布式训练相关参数
+    parser.add_argument(
+        "--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)),
+        help="local rank within a node"
+    )
+    parser.add_argument(
+        "--local_world_size", type=int, default=int(os.environ.get("LOCAL_WORLD_SIZE", 1)),
+        help="number of processes per node"
+    )
+    parser.add_argument(
+        "--node_rank", type=int, default=int(os.environ.get("RANK", 0)),
+        help="rank of the current node"
+    )
+    parser.add_argument(
+        "--num_nodes", type=int, default=int(os.environ.get("PET_NNODES", 1)),
+        help="number of nodes in the cluster"
+    )
+    parser.add_argument(
+        "--master_addr", type=str, default=os.environ.get("MASTER_ADDR", "localhost"),
+        help="master node address"
+    )
+    parser.add_argument(
+        "--master_port", type=str, default=os.environ.get("MASTER_PORT", "29500"),
+        help="master node port"
+    )
+    parser.add_argument(
+        "--backend", type=str, default="nccl", help="distributed backend"
+    )
     return parser.parse_args()
 
+# 初始化分布式环境
+def init_distributed(args):
+    # 设置进程组初始化的环境变量
+    os.environ["MASTER_ADDR"] = args.master_addr
+    os.environ["MASTER_PORT"] = args.master_port
+
+    # 计算全局 rank
+    # global_rank = args.node_rank * args.local_world_size + args.local_rank
+    # world_size = args.num_nodes * args.local_world_size
+
+    # 初始化进程组
+    dist.init_process_group(
+        backend=args.backend,
+        # world_size=world_size,
+        # rank=global_rank,
+    )
+    world_size = dist.get_world_size()
+    global_rank = dist.get_rank()
+    # 设置当前设备
+    torch.cuda.set_device(args.local_rank)
+    device = torch.device(f"cuda:{args.local_rank}")
+
+    # 打印初始化信息
+    print(f"Initialized process group: world_size={world_size}, "
+          f"local_rank={args.local_rank}, global_rank={global_rank}, "
+          f"node_rank={args.node_rank}, device={device}")
+
+    return global_rank, world_size, device
+
+# 增加打印带 rank 信息的函数
+def setup_rank_print(global_rank):
+    original_print = builtins.print
+    def rank_print(*args, **kwargs):
+        original_print(f"[RANK {global_rank}] ", *args, **kwargs)
+    builtins.print = rank_print
+
+def download_movielens(data_dir="./ml-1m", global_rank=0):
+    if global_rank == 0:
+        os.makedirs(data_dir, exist_ok=True)
+        if os.path.exists(os.path.join(data_dir, "ratings.dat")):
+            print(f"MovieLens in {data_dir}")
+            return data_dir
+
+        url = "https://files.grouplens.org/datasets/movielens/ml-1m.zip"
+        zip_path = os.path.join(data_dir, "ml-1m.zip")
+
+        print(f"download MovieLens-1M...")
+        urllib.request.urlretrieve(url, zip_path)
+
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(os.path.dirname(data_dir))
+
+        extracted_dir = os.path.join(os.path.dirname(data_dir), "ml-1m")
+        if extracted_dir != data_dir:
+            for file in os.listdir(extracted_dir):
+                shutil.move(
+                    os.path.join(extracted_dir, file), os.path.join(data_dir, file)
+                )
+            if os.path.exists(extracted_dir):
+                shutil.rmtree(extracted_dir)
+
+        os.remove(zip_path)
+
+    return data_dir
 
 class MovieLensDataset(Dataset):
     def __init__(self, data_path: str, split: str = "train"):
@@ -413,7 +462,7 @@ def get_planner(device, eb_configs, batch_size):
     )
 
 
-def get_dynamicemb_dmp(ebc, args):
+def get_dynamicemb_dmp(ebc, args, device):
     eb_configs = ebc.embedding_configs()
     # set optimizer args
     learning_rate = args.lr
@@ -436,7 +485,6 @@ def get_dynamicemb_dmp(ebc, args):
     fused_params["output_dtype"] = SparseType.FP32
     fused_params.update(optimizer_kwargs)
 
-    # precision of all-to-all
     qcomm_codecs_registry = (
         get_qcomm_codecs_registry(
             qcomms_config=QCommsConfig(
@@ -446,7 +494,7 @@ def get_dynamicemb_dmp(ebc, args):
                 backward_precision=CommType.FP32,
             )
         )
-        if backend == "nccl"
+        if args.backend == "nccl"
         else None
     )
 
@@ -461,7 +509,10 @@ def get_dynamicemb_dmp(ebc, args):
 
     planner = get_planner(device, eb_configs, args.batch_size)
     # Same usage of TorchREC
-    plan = planner.collective_plan(ebc, [sharder], dist.GroupMember.WORLD)
+    pg_cpu = dist.new_group(backend="gloo")
+    plan = planner.collective_plan(ebc, [sharder], pg_cpu)
+
+    data_parallel_wrapper = DefaultDataParallelWrapper(allreduce_comm_precision="fp16")
 
     # Same usage of TorchREC
     dmp = DistributedModelParallel(
@@ -470,18 +521,18 @@ def get_dynamicemb_dmp(ebc, args):
         # pyre-ignore
         sharders=[sharder],
         plan=plan,
+        data_parallel_wrapper=data_parallel_wrapper,
     )
     return dmp
 
 
-def create_model(args):
+def create_model(args, device):
     eb_configs = [
         EmbeddingConfig(
             name="user_id",
             embedding_dim=args.embedding_dim,
-            num_embeddings=args.num_embeddings,  # sum for all ranks.
+            num_embeddings=args.num_embeddings,
             feature_names=["user_id"],
-            data_type=DataType.FP32,  # weight or embedding's data type.
         ),
         EmbeddingConfig(
             name="movie_id",
@@ -517,7 +568,7 @@ def create_model(args):
 
     ec = EmbeddingCollection(
         tables=eb_configs,
-        device=torch.device("meta"),  # set device to 'meta
+        device=torch.device("meta"),
     )
 
     mlp_dims = [int(dim) for dim in args.mlp_dims.split(",")]
@@ -529,38 +580,184 @@ def create_model(args):
         over_arch_layer_sizes=mlp_dims,
     )
 
-    model.embedding_module = get_dynamicemb_dmp(ec, args)
+    model.embedding_module = get_dynamicemb_dmp(ec, args, device)
 
     return model
 
 
-def train_one_epoch(model, train_loader, optimizer, loss_fn, epoch, total_epochs):
-    model.train()
-    total_loss = 0
+def train(args, global_rank, world_size, device):
+    train_dataset = MovieLensDataset(args.data_path, split="train")
+    test_dataset = MovieLensDataset(args.data_path, split="test")
 
-    for batch_idx, (features, labels) in enumerate(train_loader):
-        features = features.to(device)
-        labels = labels.to(device)
+    # 使用全局 rank 和 world_size 创建采样器
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True
+    )
+    test_sampler = DistributedSampler(
+        test_dataset, num_replicas=world_size, rank=global_rank, shuffle=False
+    )
 
-        outputs = model(features)
-        loss = loss_fn(outputs, labels)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=4,
+        sampler=train_sampler,
+    )
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=4,
+        sampler=test_sampler,
+    )
 
-        total_loss += loss.item()
+    # 创建模型并传递更新后的设备
+    model = create_model(args, device)
+    model.to(device)
 
-        if batch_idx % 100 == 0:
-            print(
-                f"Epoch {epoch+1}/{total_epochs}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}"
-            )
+    optimizer = Adam(model.parameters(), lr=args.lr)
+    criterion = nn.MSELoss()
 
-    avg_loss = total_loss / len(train_loader)
-    print(f"Epoch {epoch+1}/{total_epochs}, Average Loss: {avg_loss:.4f}")
+    for epoch in range(args.epochs):
+        train_sampler.set_epoch(epoch)
+        model.train()
+        total_loss = 0
+
+        for batch_idx, (features, labels) in enumerate(train_loader):
+            features = features.to(device)
+            labels = labels.to(device)
+
+            outputs = model(features)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            if batch_idx % 100 == 0:
+                print(
+                    f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}"
+                )
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{args.epochs}, Average Loss: {avg_loss:.4f}")
+
+        model.eval()
+        test_loss = 0
+        with torch.no_grad():
+            for features, labels in test_loader:
+                features = features.to(device)
+                labels = labels.to(device)
+
+                outputs = model(features)
+                loss = criterion(outputs, labels)
+                test_loss += loss.item()
+
+        avg_test_loss = test_loss / len(test_loader)
+        print(f"Epoch {epoch+1}/{args.epochs}, Test Loss: {avg_test_loss:.4f}")
 
 
-def test_one_epoch(model, test_loader, loss_fn, epoch, total_epochs):
+def dump(args, global_rank, world_size, device):
+    os.makedirs(args.save_dir, exist_ok=True)
+    train_dataset = MovieLensDataset(args.data_path, split="train")
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=4,
+        sampler=train_sampler,
+    )
+
+    model = create_model(args, device)
+    model.to(device)
+
+    optimizer = Adam(model.parameters(), lr=args.lr)
+    criterion = nn.MSELoss()
+
+    for epoch in range(args.epochs):
+        train_sampler.set_epoch(epoch)
+        model.train()
+        total_loss = 0
+
+        for batch_idx, (features, labels) in enumerate(train_loader):
+            features = features.to(device)
+            labels = labels.to(device)
+
+            outputs = model(features)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            if batch_idx % 100 == 0:
+                print(
+                    f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}"
+                )
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{args.epochs}, Average Loss: {avg_loss:.4f}")
+
+        # 保存模型
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            },
+            os.path.join(args.save_dir, f"model_epoch_{epoch+1}_rank{global_rank}.pt"),
+        )
+
+    # 使用全局 rank 进行 dump
+    DynamicEmbDump(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
+
+
+def load(args, global_rank, world_size, device):
+    os.makedirs(args.save_dir, exist_ok=True)
+    test_dataset = MovieLensDataset(args.data_path, split="test")
+    test_sampler = DistributedSampler(
+        test_dataset, num_replicas=world_size, rank=global_rank, shuffle=False
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=4,
+        sampler=test_sampler,
+    )
+
+    model = create_model(args, device)
+    model.to(device)
+
+    optimizer = Adam(model.parameters(), lr=args.lr)
+    criterion = nn.MSELoss()
+
+    # 加载模型
+    checkpoint = torch.load(
+        os.path.join(args.save_dir, f"model_epoch_{args.epochs}_rank{global_rank}.pt"),
+        weights_only=True,
+    )
+    # Must set strict to False, as there is no embedding's weight in model.state_dict()
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    # 所有 rank 从相同的文件加载
+    DynamicEmbLoad(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
+
     model.eval()
     test_loss = 0
     with torch.no_grad():
@@ -569,138 +766,24 @@ def test_one_epoch(model, test_loader, loss_fn, epoch, total_epochs):
             labels = labels.to(device)
 
             outputs = model(features)
-            loss = loss_fn(outputs, labels)
+            loss = criterion(outputs, labels)
             test_loss += loss.item()
 
     avg_test_loss = test_loss / len(test_loader)
-    print(f"Epoch {epoch+1}/{total_epochs}, Test Loss: {avg_test_loss:.4f}")
+    print(f"Test Loss: {avg_test_loss:.4f}")
 
-
-def train(args):
-    train_dataset = MovieLensDataset(args.data_path, split="train")
-    test_dataset = MovieLensDataset(args.data_path, split="test")
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=local_rank, shuffle=True
-    )
-    test_sampler = DistributedSampler(
-        test_dataset, num_replicas=world_size, rank=local_rank, shuffle=False
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=4,
-        sampler=train_sampler,
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=4,
-        sampler=test_sampler,
-    )
-
-    model = create_model(args)
-    model.to(device)
-
-    optimizer = Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
-
-    for epoch in range(args.epochs):
-        train_sampler.set_epoch(epoch)
-        train_one_epoch(model, train_loader, optimizer, criterion, epoch, args.epochs)
-        test_one_epoch(model, test_loader, criterion, epoch, args.epochs)
-
-
-def dump(args):
-    os.makedirs(args.save_dir, exist_ok=True)
-    train_dataset = MovieLensDataset(args.data_path, split="train")
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=local_rank, shuffle=True
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=4,
-        sampler=train_sampler,
-    )
-
-    model = create_model(args)
-    model.to(device)
-
-    optimizer = Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
-
-    for epoch in range(args.epochs):
-        train_sampler.set_epoch(epoch)
-        train_one_epoch(model, train_loader, optimizer, criterion, epoch, args.epochs)
-
-        # ShardedDyanmicEmbeddingCollection.state_dict() will return a dummy tensor.
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            },
-            os.path.join(args.save_dir, f"model_epoch_{epoch+1}_rank{local_rank}.pt"),
-        )
-    # rank0 will gether embedding from other ranks, so no need to identify rank info.
-    DynamicEmbDump(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
-
-
-def load(args):
-    os.makedirs(args.save_dir, exist_ok=True)
-    test_dataset = MovieLensDataset(args.data_path, split="test")
-    test_sampler = DistributedSampler(
-        test_dataset, num_replicas=world_size, rank=local_rank, shuffle=False
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=4,
-        sampler=test_sampler,
-    )
-
-    model = create_model(args)
-    model.to(device)
-
-    optimizer = Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
-
-    # load
-    checkpoint = torch.load(
-        os.path.join(args.save_dir, f"model_epoch_{args.epochs}_rank{local_rank}.pt"),
-        weights_only=True,
-    )
-    # Must set strict to False, as there is no embedding's weight in model.state_dict()
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-    # all rank will load from the same files.
-    DynamicEmbLoad(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
-
-    test_one_epoch(model, test_loader, criterion, 0, 1)
-
-    dist.barrier(device_ids=[local_rank])
-    if local_rank == 0:
+    # 使用设备 ID
+    dist.barrier(device_ids=[args.local_rank])
+    if global_rank == 0:
         shutil.rmtree(args.save_dir)
-    dist.barrier(device_ids=[local_rank])
+    dist.barrier(device_ids=[args.local_rank])
 
 
-def inc_dump(args):
+def inc_dump(args, global_rank, world_size, device):
     os.makedirs(args.save_dir, exist_ok=True)
     train_dataset = MovieLensDataset(args.data_path, split="train")
     train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=local_rank, shuffle=True
+        train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True
     )
 
     train_loader = DataLoader(
@@ -712,7 +795,7 @@ def inc_dump(args):
         sampler=train_sampler,
     )
 
-    model = create_model(args)
+    model = create_model(args, device)
     model.to(device)
 
     optimizer = Adam(model.parameters(), lr=args.lr)
@@ -743,12 +826,7 @@ def inc_dump(args):
                 ret_tensors, undumped_score = incremental_dump(model, undumped_score)
                 dump_number = 0
                 for module_path, named_tensors in ret_tensors.items():
-                    for (
-                        table_name,
-                        tensors,
-                    ) in (
-                        named_tensors.items()
-                    ):  # tensors[0] and tensors[1] are keys and values.
+                    for table_name, tensors in named_tensors.items():
                         dump_number += tensors[0].size(0)
                 print(
                     f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}, dump number: {dump_number}"
@@ -760,22 +838,37 @@ def inc_dump(args):
 
 def main():
     args = parse_args()
+
+    # 初始化分布式环境
+    global_rank, world_size, device = init_distributed(args)
+
+    # 设置打印带有 rank 信息的函数
+    setup_rank_print(global_rank)
+
+    # 设置随机种子
     torch.cuda.manual_seed(args.seed)
     np.random.seed(args.seed)
-    if local_rank == 0:
+
+    # 只在全局 rank 0 上下载数据
+    if args.local_rank == 0:
         download_movielens(args.data_path)
-    dist.barrier(device_ids=[local_rank])
+
+    # 确保所有进程等待数据下载完成
+    dist.barrier()
+
+    # 调用相应的函数
     if args.train:
-        train(args)
+        train(args, global_rank, world_size, device)
     if args.dump:
-        dump(args)
+        dump(args, global_rank, world_size, device)
     if args.load:
-        load(args)
+        load(args, global_rank, world_size, device)
     if args.incremental_dump:
-        inc_dump(args)
+        inc_dump(args, global_rank, world_size, device)
+
+    # 销毁进程组
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     main()
-
-dist.destroy_process_group()

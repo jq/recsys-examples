@@ -1,0 +1,44 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: h100-single-node-jq
+  namespace: default
+  labels:
+    kueue.x-k8s.io/priority-class: p0-priority
+    kueue.x-k8s.io/queue-name: dws-local-queue
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
+            sidecar.istio.io/inject: 'false'
+        spec:
+          containers:
+            - name: pytorch
+              image:  gcr.io/snap-bento-training/recsys-examples:latest
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -e
+                   torchrun --standalone --nproc_per_node=8 corelib/dynamicemb/example/example.py  --train
+              resources:
+                requests:
+                  nvidia.com/gpu: 8
+                limits:
+                  nvidia.com/gpu: 8
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-h100-80gb
+          tolerations:
+            - key: "a3-highgpu-8g"
+              operator: "Exists"
+              effect: "NoSchedule"
+            - key: "nvidia.com/gpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            - key: "training-operator-jobs"
+              operator: "Exists"
+              effect: "NoSchedule"

@@ -1,0 +1,142 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: h100-multi-nodes-jq
+  namespace: default
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
+            sidecar.istio.io/inject: 'false'
+        spec:
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi
+          containers:
+            - name: pytorch
+              image: gcr.io/snap-bento-training/recsys-examples:latest
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -e
+                  export TORCH_DISTRIBUTED_DEBUG=DETAIL
+                  export NCCL_DEBUG=INFO
+                  torchrun --nnodes=${PET_NNODES} --nproc_per_node=8 \
+                           --node_rank=${RANK} \
+                           --max_restarts=3 \
+                           --monitor_interval=30 \
+                            --rdzv_conf=timeout=3600 \
+                           --rdzv_backend=static \
+                           --rdzv-id=jq-multi-nodes-hkv \
+                           --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                  corelib/dynamicemb/example/example.py  --train
+              env:
+                - { name: NCCL_PORT_RANGE,    value: "43000-46000" }
+                - {name: NCCL_COLLNET_DISABLE, value: "1"}
+                - {name: NCCL_SHARP_DISABLE, value: "1"}
+                - {name: TORCH_DISTRIBUTED_DEBUG, value: DETAIL}
+                - name: GLOO_SOCKET_IFNAME
+                  value: eth0
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: eth0
+                - name: NCCL_IB_DISABLE
+                  value: "1"
+                - name: PYTHONHASHSEED
+                  value: "0"
+              resources:
+                requests:
+                  nvidia.com/gpu: 8
+                limits:
+                  nvidia.com/gpu: 8
+          nodeSelector:
+            cloud.google.com/gke-nodepool: a3-highgpu-8g-on-demand
+          tolerations:
+            - key: "a3-highgpu-8g"
+              operator: "Exists"
+              effect: "NoSchedule"
+            - key: "nvidia.com/gpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            - key: "training-operator-jobs"
+              operator: "Exists"
+              effect: "NoSchedule"
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
+            sidecar.istio.io/inject: 'false'
+        spec:
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi
+          containers:
+            - name: pytorch
+              image: gcr.io/snap-bento-training/recsys-examples:latest
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -e
+                  export TORCH_DISTRIBUTED_DEBUG=DETAIL
+                  export NCCL_DEBUG=INFO
+                  torchrun --nnodes=${PET_NNODES} --nproc_per_node=8 \
+                           --node_rank=${RANK} \
+                           --max_restarts=3 \
+                           --monitor_interval=30 \
+                            --rdzv_conf=timeout=3600 \
+                           --rdzv_backend=static \
+                           --rdzv-id=jq-multi-nodes-hkv \
+                           --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                  corelib/dynamicemb/example/example.py  --train
+              env:
+                - { name: NCCL_PORT_RANGE,    value: "43000-46000" }
+                - { name: NCCL_COLLNET_DISABLE, value: "1" }
+                - { name: NCCL_SHARP_DISABLE, value: "1" }
+                - { name: TORCH_DISTRIBUTED_DEBUG, value: DETAIL }
+                - name: GLOO_SOCKET_IFNAME
+                  value: eth0
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: eth0
+                - name: NCCL_IB_DISABLE
+                  value: "1"
+                - name: PYTHONHASHSEED
+                  value: "0"
+              resources:
+                requests:
+                  nvidia.com/gpu: 8
+                limits:
+                  nvidia.com/gpu: 8
+          nodeSelector:
+            cloud.google.com/gke-nodepool: a3-highgpu-8g-on-demand
+          tolerations:
+            - key: "a3-highgpu-8g"
+              operator: "Exists"
+              effect: "NoSchedule"
+            - key: "nvidia.com/gpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+            - key: "training-operator-jobs"
+              operator: "Exists"
+              effect: "NoSchedule"
